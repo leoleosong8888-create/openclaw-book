@@ -5,3 +5,4 @@
 - [4) 운영 팁](04-ops-tips.md)
 - [5) 배포 가이드 (GitHub Pages)](05-deploy-github-pages.md)
 - [6) Deep Dive: Power/Loops/Memory/Build](06-clawdbot-power-and-experiments.md)
+- [7) 공유 링크 요약: OPEC+ vs 비OPEC+](07-oil-market-shared-chat-summary.md)
