@@ -4,3 +4,4 @@
 - [3) 실행 흐름](03-flow.md)
 - [4) 운영 팁](04-ops-tips.md)
 - [5) 배포 가이드 (GitHub Pages)](05-deploy-github-pages.md)
+- [6) 한국 날씨 그래프 대시보드](weather-dashboard.html)
