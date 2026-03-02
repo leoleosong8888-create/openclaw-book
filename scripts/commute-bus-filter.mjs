@@ -4,7 +4,7 @@ const API_BASE = 'https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArr
 
 const serviceKey = process.env.BUS_API_KEY || 'd05c817068c14fa7278d282cbf0bbe9ad62a2563f182cf13d720dc634bd5f7db';
 const stationId = process.env.BUS_STATION_ID || '228000997';
-const routeFilter = (process.env.BUS_ROUTE_FILTER || '39,19-1,102,1303')
+const routeFilter = (process.env.BUS_ROUTE_FILTER || '39,39-1,102,1303')
   .split(',')
   .map((v) => v.trim())
   .filter(Boolean);
