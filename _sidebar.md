@@ -1,5 +1,8 @@
 - [홈](README.md)
 
+- 날씨
+  - [📊 한국 날씨 그래프](weather-dashboard.md)
+
 - OpenClaw 분석
   - [개요](README.md)
   - [아키텍처 개요](01-architecture.md)
@@ -7,7 +10,6 @@
   - [실행 흐름](03-flow.md)
   - [운영 팁](04-ops-tips.md)
   - [배포 가이드 (GitHub Pages)](05-deploy-github-pages.md)
-  - [📊 한국 날씨 그래프](weather-dashboard.md)
 
 - Deep Dive
   - [Power / Loops / Memory / Build](06-clawdbot-power-and-experiments.md)
