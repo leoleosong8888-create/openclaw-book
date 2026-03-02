@@ -1,5 +1,8 @@
 - [홈](README.md)
 
+- AI 쉽게 배우기 (초6)
+  - [AI와 LLM 지도](00-ai-llm-for-grade6.md)
+
 - 날씨
   - [📊 한국 날씨 그래프](weather-dashboard.md)
 
