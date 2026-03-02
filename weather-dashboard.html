@@ -51,13 +51,18 @@
     <div class="panel"><canvas id="rainWindChart"></canvas></div>
     <div class="panel" id="tablePanel" style="overflow:auto;"></div>
     <p class="muted" id="meta"></p>
+    <p class="muted" id="buildInfo"></p>
   </div>
 
   <script>
+    var BUILD_VERSION = 'd456f1e';
+    var BUILD_TIME_KST = '2026-03-02 09:33 KST';
+
     var cityEl = document.getElementById('city');
     var statusEl = document.getElementById('status');
     var summaryEl = document.getElementById('summary');
     var metaEl = document.getElementById('meta');
+    var buildInfoEl = document.getElementById('buildInfo');
     var errorBox = document.getElementById('errorBox');
     var tablePanel = document.getElementById('tablePanel');
     var tempChart = null;
@@ -74,6 +79,20 @@
       today: "(fallback)",
       yesterday: "(fallback)"
     };
+
+    function nowKstString() {
+      var parts = new Intl.DateTimeFormat('sv-SE', {
+        timeZone: 'Asia/Seoul',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+      }).formatToParts(new Date());
+      function g(type) {
+        for (var i = 0; i < parts.length; i++) if (parts[i].type === type) return parts[i].value;
+        return '';
+      }
+      return g('year') + '-' + g('month') + '-' + g('day') + ' ' + g('hour') + ':' + g('minute') + ':' + g('second') + ' KST';
+    }
 
     function dateInTz(date, tz) {
       var parts = new Intl.DateTimeFormat('en-CA', {
@@ -246,6 +265,7 @@
 
         if (!chartOk) showError('차트 라이브러리 로딩 실패: 표 데이터로 대체 표시 중');
         metaEl.textContent = '지역: ' + city + ' | 시간대: ' + fetched.tz + ' | 출처: Open-Meteo';
+        buildInfoEl.textContent = '배포 버전: ' + BUILD_VERSION + ' | 배포 시각: ' + BUILD_TIME_KST + ' | 현재 시각: ' + nowKstString();
         statusEl.textContent = '완료';
       } catch (e) {
         // 장애 상황에서도 사용자에게 그래프를 보여주기 위해 fallback 표시
@@ -253,6 +273,7 @@
         drawCharts(FALLBACK_SERIES);
         renderTable(FALLBACK_SERIES);
         metaEl.textContent = '출처: fallback 샘플 데이터';
+        buildInfoEl.textContent = '배포 버전: ' + BUILD_VERSION + ' | 배포 시각: ' + BUILD_TIME_KST + ' | 현재 시각: ' + nowKstString();
         statusEl.textContent = '네트워크 실패로 fallback 표시';
         showError('실시간 데이터 조회 실패: ' + (e && e.message ? e.message : e));
       }
