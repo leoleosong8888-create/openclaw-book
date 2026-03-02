@@ -49,6 +49,7 @@
     <div class="cards" id="summary"></div>
     <div class="panel"><canvas id="tempChart"></canvas></div>
     <div class="panel"><canvas id="rainWindChart"></canvas></div>
+    <div class="panel" id="tablePanel" style="overflow:auto;"></div>
     <p class="muted" id="meta"></p>
   </div>
 
@@ -58,6 +59,7 @@
     var summaryEl = document.getElementById('summary');
     var metaEl = document.getElementById('meta');
     var errorBox = document.getElementById('errorBox');
+    var tablePanel = document.getElementById('tablePanel');
     var tempChart = null;
     var rainWindChart = null;
 
@@ -159,6 +161,7 @@
     }
 
     function drawCharts(s) {
+      if (typeof Chart === 'undefined') return false;
       if (tempChart) tempChart.destroy();
       if (rainWindChart) rainWindChart.destroy();
 
@@ -189,6 +192,31 @@
           }
         }
       });
+      return true;
+    }
+
+    function renderTable(s) {
+      var html = "<table style='width:100%;border-collapse:collapse;font-size:13px'>" +
+        "<thead><tr>" +
+        "<th style='text-align:left;padding:6px;border-bottom:1px solid #334'>시간</th>" +
+        "<th style='text-align:right;padding:6px;border-bottom:1px solid #334'>온도</th>" +
+        "<th style='text-align:right;padding:6px;border-bottom:1px solid #334'>체감</th>" +
+        "<th style='text-align:right;padding:6px;border-bottom:1px solid #334'>강수(mm)</th>" +
+        "<th style='text-align:right;padding:6px;border-bottom:1px solid #334'>바람(km/h)</th>" +
+        "<th style='text-align:right;padding:6px;border-bottom:1px solid #334'>어제온도</th>" +
+        "</tr></thead><tbody>";
+      for (var i = 0; i < s.labels.length; i++) {
+        html += "<tr>" +
+          "<td style='padding:6px;border-bottom:1px solid #223'>" + s.labels[i] + "</td>" +
+          "<td style='padding:6px;border-bottom:1px solid #223;text-align:right'>" + s.todayTemp[i].toFixed(1) + "</td>" +
+          "<td style='padding:6px;border-bottom:1px solid #223;text-align:right'>" + s.feels[i].toFixed(1) + "</td>" +
+          "<td style='padding:6px;border-bottom:1px solid #223;text-align:right'>" + s.rain[i].toFixed(1) + "</td>" +
+          "<td style='padding:6px;border-bottom:1px solid #223;text-align:right'>" + s.wind[i].toFixed(1) + "</td>" +
+          "<td style='padding:6px;border-bottom:1px solid #223;text-align:right'>" + (s.yesterdayTemp[i] == null ? '-' : s.yesterdayTemp[i].toFixed(1)) + "</td>" +
+          "</tr>";
+      }
+      html += "</tbody></table>";
+      tablePanel.innerHTML = html;
     }
 
     function showError(msg) {
@@ -213,14 +241,17 @@
         var fetched = await fetchWeather(lat, lon);
         var s = makeSeries(fetched.data, fetched.tz);
         drawSummary(s);
-        drawCharts(s);
+        var chartOk = drawCharts(s);
+        renderTable(s);
 
+        if (!chartOk) showError('차트 라이브러리 로딩 실패: 표 데이터로 대체 표시 중');
         metaEl.textContent = '지역: ' + city + ' | 시간대: ' + fetched.tz + ' | 출처: Open-Meteo';
         statusEl.textContent = '완료';
       } catch (e) {
         // 장애 상황에서도 사용자에게 그래프를 보여주기 위해 fallback 표시
         drawSummary(FALLBACK_SERIES);
         drawCharts(FALLBACK_SERIES);
+        renderTable(FALLBACK_SERIES);
         metaEl.textContent = '출처: fallback 샘플 데이터';
         statusEl.textContent = '네트워크 실패로 fallback 표시';
         showError('실시간 데이터 조회 실패: ' + (e && e.message ? e.message : e));
