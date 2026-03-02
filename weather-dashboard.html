@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>한국 날씨 그래프</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --bg:#0b1020; --card:#121933; --text:#ecf2ff; --muted:#9fb3d9; }
+    body { margin:0; font-family:Pretendard,"Noto Sans KR",sans-serif; background:linear-gradient(180deg,#0a0f1f,#0f1730); color:var(--text); }
+    .wrap { max-width:1100px; margin:0 auto; padding:20px; }
+    .controls,.panel,.card { background:rgba(18,25,51,.82); border:1px solid rgba(120,149,214,.2); border-radius:12px; }
+    .controls { padding:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+    select,button { border:1px solid rgba(140,170,240,.35); background:#0f1730; color:var(--text); border-radius:10px; padding:8px 10px; }
+    button { cursor:pointer; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; margin-bottom:12px; }
+    .card { padding:10px 12px; }
+    .label { color:var(--muted); font-size:12px; }
+    .value { font-size:20px; font-weight:700; margin-top:4px; }
+    .panel { padding:10px; margin-bottom:12px; }
+    canvas { width:100% !important; height:320px !important; }
+    .muted { color:var(--muted); font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>📊 한국 날씨 그래프</h1>
+    <p class="muted">오늘 시간별 + 어제 동일 시간 온도 비교 (Open-Meteo)</p>
+
+    <div class="controls">
+      <label for="city">지역</label>
+      <select id="city">
+        <option value="37.5665,126.9780">서울</option>
+        <option value="35.1796,129.0756">부산</option>
+        <option value="37.4563,126.7052">인천</option>
+        <option value="35.8714,128.6014">대구</option>
+        <option value="35.1595,126.8526">광주</option>
+        <option value="36.3504,127.3845">대전</option>
+        <option value="35.5384,129.3114">울산</option>
+        <option value="33.4996,126.5312">제주</option>
+      </select>
+      <button id="reload">새로고침</button>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <div class="cards" id="summary"></div>
+    <div class="panel"><canvas id="tempChart"></canvas></div>
+    <div class="panel"><canvas id="rainWindChart"></canvas></div>
+    <p class="muted" id="meta"></p>
+  </div>
+
+  <script>
+    const cityEl = document.getElementById('city');
+    const statusEl = document.getElementById('status');
+    const summaryEl = document.getElementById('summary');
+    const metaEl = document.getElementById('meta');
+    let tempChart, rainWindChart;
+
+    const dateInTz = (date,tz)=>{
+      const p=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date);
+      const g=t=>p.find(x=>x.type===t)?.value; return `${g('year')}-${g('month')}-${g('day')}`;
+    };
+
+    async function fetchWeather(lat, lon) {
+      const tz='Asia/Seoul';
+      const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,apparent_temperature,precipitation,wind_speed_10m&timezone=${encodeURIComponent(tz)}&past_days=1&forecast_days=1`;
+      const r=await fetch(url); if(!r.ok) throw new Error(`HTTP ${r.status}`); return {data:await r.json(),tz};
+    }
+
+    function makeSeries(data,tz){
+      const {time,temperature_2m:t,apparent_temperature:f,precipitation:p,wind_speed_10m:w}=data.hourly;
+      const today=dateInTz(new Date(),tz);
+      const dates=[...new Set(time.map(x=>x.slice(0,10)))].sort();
+      const yesterday=dates.filter(d=>d<today).at(-1)||dates[0];
+      const td={}, yd={};
+      for(let i=0;i<time.length;i++){
+        const d=time[i].slice(0,10), h=time[i].slice(11,16);
+        if(d===today) td[h]={t:t[i],f:f[i],p:p[i],w:w[i]};
+        if(d===yesterday) yd[h]=t[i];
+      }
+      const labels=Object.keys(td).sort();
+      return {labels,todayTemp:labels.map(h=>td[h].t),feels:labels.map(h=>td[h].f),yesterdayTemp:labels.map(h=>yd[h]??null),rain:labels.map(h=>td[h].p),wind:labels.map(h=>td[h].w),today,yesterday};
+    }
+
+    function drawSummary(s){
+      const avg=a=>a.reduce((x,y)=>x+y,0)/a.length;
+      summaryEl.innerHTML=`
+        <div class='card'><div class='label'>최고/최저</div><div class='value'>${Math.max(...s.todayTemp).toFixed(1)}° / ${Math.min(...s.todayTemp).toFixed(1)}°</div></div>
+        <div class='card'><div class='label'>평균 체감</div><div class='value'>${avg(s.feels).toFixed(1)}°C</div></div>
+        <div class='card'><div class='label'>누적 강수</div><div class='value'>${s.rain.reduce((a,b)=>a+b,0).toFixed(1)} mm</div></div>
+        <div class='card'><div class='label'>평균 바람</div><div class='value'>${avg(s.wind).toFixed(1)} km/h</div></div>`;
+    }
+
+    function drawCharts(s){
+      tempChart?.destroy(); rainWindChart?.destroy();
+      tempChart=new Chart(document.getElementById('tempChart'),{type:'line',data:{labels:s.labels,datasets:[
+        {label:'오늘 온도',data:s.todayTemp,borderColor:'#59c3ff',tension:.3,pointRadius:1.5},
+        {label:'체감온도',data:s.feels,borderColor:'#7bd389',tension:.3,pointRadius:1.5},
+        {label:'어제 온도',data:s.yesterdayTemp,borderColor:'#ff8fab',borderDash:[5,5],tension:.3,pointRadius:1.5}
+      ]}});
+      rainWindChart=new Chart(document.getElementById('rainWindChart'),{data:{labels:s.labels,datasets:[
+        {type:'bar',label:'강수(mm)',data:s.rain,backgroundColor:'rgba(255,209,102,.65)',yAxisID:'y'},
+        {type:'line',label:'바람(km/h)',data:s.wind,borderColor:'#b28dff',tension:.3,pointRadius:1.5,yAxisID:'y1'}
+      ]},options:{scales:{y:{type:'linear',position:'left'},y1:{type:'linear',position:'right',grid:{drawOnChartArea:false}}}}});
+    }
+
+    async function load(){
+      try{
+        statusEl.textContent='조회 중...';
+        const [lat,lon]=cityEl.value.split(',').map(Number);
+        const city=cityEl.options[cityEl.selectedIndex].text;
+        const {data,tz}=await fetchWeather(lat,lon);
+        const s=makeSeries(data,tz);
+        drawSummary(s); drawCharts(s);
+        metaEl.textContent=`지역: ${city} | 시간대: ${tz} | 출처: Open-Meteo`;
+        statusEl.textContent='완료';
+      }catch(e){statusEl.textContent=`실패: ${e.message}`;}
+    }
+
+    document.getElementById('reload').addEventListener('click',load);
+    cityEl.addEventListener('change',load);
+    load();
+  </script>
+</body>
+</html>
