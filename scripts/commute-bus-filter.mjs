@@ -74,8 +74,7 @@ async function main() {
     const route = item.routeName || item.routeNm;
     const toward = item.stationNm1 || item.stationNm2 || '-';
     const a1 = formatArrival(item, 1) || '정보 없음';
-    const a2 = formatArrival(item, 2) || '정보 없음';
-    return `- ${route} (${toward}): ${a1} / 다음 ${a2}`;
+    return `- ${route}: ${a1} / ${toward}`;
   });
 
   console.log(

@@ -86,8 +86,7 @@ async function main() {
   const lines = merged.map((item) => {
     const toward = item.stationNm1 || item.stationNm2 || '-';
     const a1 = formatArrival(item, 1) || '정보 없음';
-    const a2 = formatArrival(item, 2) || '정보 없음';
-    return `- ${item._route} [${item._stationName} ${item._stationId}] (${toward}): ${a1} / 다음 ${a2}`;
+    return `- ${item._route}: ${a1} / ${toward}`;
   });
 
   console.log([
