@@ -124,26 +124,150 @@ let systemPromptText = createSystemPromptOverride(appendPrompt)();
 
 ---
 
-## 5) 세션 파일 락 + 세션 매니저 초기화
+## 5) 세션 파일 락 + 세션 매니저 초기화 (상세)
 
 **코드 위치:** `L829~L899`
 
 관련 함수:
 - `acquireSessionWriteLock`
+- `resolveSessionLockMaxHoldFromTimeout`
 - `repairSessionFileIfNeeded`
+- `prewarmSessionFile`
 - `SessionManager.open` + `guardSessionManager`
+- `trackSessionManagerAccess`
 - `prepareSessionManagerForRun`
+- `createPreparedEmbeddedPiSettingsManager`
 - `buildEmbeddedExtensionFactories`
+- `DefaultResourceLoader(...).reload()`
+
+### 5-1) 먼저 락을 잡는 이유
 
 ```ts
-const sessionLock = await acquireSessionWriteLock({ ... });
-await repairSessionFileIfNeeded({ sessionFile: params.sessionFile, ... });
-sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), { ... });
-await prepareSessionManagerForRun({ sessionManager, ... });
+const sessionLock = await acquireSessionWriteLock({
+  sessionFile: params.sessionFile,
+  maxHoldMs: resolveSessionLockMaxHoldFromTimeout({ timeoutMs: params.timeoutMs }),
+});
+```
+
+핵심 포인트:
+- 세션 파일은 여러 런/스레드가 동시에 접근할 수 있으므로, **쓰기 락을 선점**해서 경쟁 상태를 막는다.
+- `maxHoldMs`는 요청 timeout을 기반으로 잡혀서, 비정상 장기 점유를 줄인다.
+
+### 5-2) 파일 복구 + 존재 여부 판단
+
+```ts
+await repairSessionFileIfNeeded({ sessionFile: params.sessionFile, warn: ... });
+const hadSessionFile = await fs.stat(params.sessionFile).then(() => true).catch(() => false);
+```
+
+무슨 문제를 막나:
+- 이전 실행 중단/크래시로 세션 파일이 깨졌을 수 있음 → 사전 복구
+- 기존 세션인지 신규 세션인지(`hadSessionFile`)를 뒤 초기화 로직에서 분기 기준으로 활용
+
+### 5-3) transcript 정책 계산 (가드 옵션에 영향)
+
+```ts
+const transcriptPolicy = resolveTranscriptPolicy({
+  modelApi: params.model?.api,
+  provider: params.provider,
+  modelId: params.modelId,
+});
+```
+
+왜 여기서 하냐:
+- 세션 매니저 가드에 `allowSyntheticToolResults` 같은 정책값을 넣어야 해서,
+  세션 오픈 직전에 policy를 확정한다.
+
+### 5-4) prewarm + guard 래핑된 SessionManager 오픈
+
+```ts
+await prewarmSessionFile(params.sessionFile);
+sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), {
+  agentId: sessionAgentId,
+  sessionKey: params.sessionKey,
+  inputProvenance: params.inputProvenance,
+  allowSyntheticToolResults: transcriptPolicy.allowSyntheticToolResults,
+  allowedToolNames,
+});
+trackSessionManagerAccess(params.sessionFile);
+```
+
+핵심 포인트:
+- `prewarmSessionFile`: 디스크 I/O/캐시 측면에서 초기 접근 비용 완화
+- `guardSessionManager`: 원본 SessionManager에 안전장치 부여
+  - 허용되지 않은 툴명/비정상 tool-result 등 transcript 무결성 방어
+  - 입력 출처(`inputProvenance`) 정보도 함께 보존
+- `trackSessionManagerAccess`: 운영 관측(어떤 세션 파일이 자주 접근되는지)
+
+### 5-5) 런 실행 전 세션 상태 정렬
+
+```ts
+await prepareSessionManagerForRun({
+  sessionManager,
+  sessionFile: params.sessionFile,
+  hadSessionFile,
+  sessionId: params.sessionId,
+  cwd: effectiveWorkspace,
+});
+```
+
+이 단계의 역할:
+- 이전 leaf/branch 포인터나 메타 상태를 현재 런 컨텍스트에 맞게 정렬
+- 신규/기존 세션 모두에서 "지금 프롬프트를 시작 가능한 상태"로 보장
+
+### 5-6) 설정 매니저 + 확장 팩토리 준비
+
+```ts
+const settingsManager = createPreparedEmbeddedPiSettingsManager({
+  cwd: effectiveWorkspace,
+  agentDir,
+  cfg: params.config,
+});
+
+const extensionFactories = buildEmbeddedExtensionFactories({
+  cfg: params.config,
+  sessionManager,
+  provider: params.provider,
+  modelId: params.modelId,
+  model: params.model,
+});
 ```
 
 핵심:
-- 동시성/세션 손상/tool-result 불일치에 대한 방어 지점
+- `settingsManager`: 에이전트 설정 해석/적용의 중심
+- `extensionFactories`: compaction/pruning 같은 런타임 보호 확장을 제공
+
+### 5-7) 필요할 때만 ResourceLoader 생성
+
+```ts
+let resourceLoader: DefaultResourceLoader | undefined;
+if (extensionFactories.length > 0) {
+  resourceLoader = new DefaultResourceLoader({
+    cwd: resolvedWorkspace,
+    agentDir,
+    settingsManager,
+    extensionFactories,
+  });
+  await resourceLoader.reload();
+}
+```
+
+왜 조건부인가:
+- 확장이 없으면 기본 로더로 충분하므로 불필요한 객체/로딩 비용을 피함
+- 확장이 있으면 반드시 로더에 등록/리로드해서 safeguard가 실제로 활성화되게 함
+
+### 5-8) 이 블록의 전체 의미
+
+이 섹션은 사실상 **"세션 무결성 부팅 단계"**다.
+
+- 락으로 동시성 제어
+- 파일 복구로 디스크 상태 정상화
+- 정책 기반 guard로 transcript 오염 방어
+- 런타임 준비로 현재 실행에 맞는 상태 정렬
+- 확장 로더 활성화로 compaction/pruning 보호 기동
+
+즉, 여기서 안정성을 확보하지 못하면 이후 `createAgentSession`이나 `prompt()` 단계에서
+에러가 나거나, 더 나쁘게는 조용히 망가진 세션이 누적될 수 있다.
 
 ---
 
