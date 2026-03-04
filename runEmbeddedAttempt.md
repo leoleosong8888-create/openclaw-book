@@ -1,224 +1,345 @@
-# runEmbeddedAttempt 함수 실행 로직 분석
+# runEmbeddedAttempt 함수 실행 로직 분석 (코드 위치 포함)
 
 대상 소스:
 - `src/agents/pi-embedded-runner/run/attempt.ts`
 - 함수: `runEmbeddedAttempt(params)`
+- 시작 라인(현재 main 기준): 대략 `L544`
 
-링크:
-- https://github.com/openclaw/openclaw/blob/main/src/agents/pi-embedded-runner/run/attempt.ts#L579
+원문 링크:
+- https://github.com/openclaw/openclaw/blob/main/src/agents/pi-embedded-runner/run/attempt.ts#L544
+
+> 아래 라인 번호는 upstream 변경에 따라 약간 이동할 수 있음.
 
 ---
 
-## 한 줄 요약
-`runEmbeddedAttempt`는 **임베디드 에이전트 1회 실행(Attempt)** 을 책임지는 오케스트레이터로,
-워크스페이스/샌드박스 준비 → 도구/프롬프트/세션 초기화 → 모델 스트림 파이프라인 보정 → 프롬프트 실행/컴팩션 대기 → 결과 스냅샷/후처리/정리까지 전체 수명을 관리한다.
+## 빠른 네비게이션 (섹션 ↔ 코드)
+
+1. 실행 시작/샌드박스: `L547~L572`
+2. 스킬/부트스트랩 컨텍스트: `L573~L610`
+3. 툴/채널 기능 구성: `L614~L737`
+4. 시스템 프롬프트 생성: `L739~L827`
+5. 세션 락/세션 매니저 준비: `L829~L899`
+6. 세션 생성 + streamFn 파이프라인: `L933~L1135`
+7. 히스토리 sanitize/검증/컷: `L1137~L1170`
+8. Abort/Timeout/Subscription: `L1179~L1341`
+9. 프롬프트 실행 본체: `L1346~L1497`
+10. Compaction 대기/스냅샷 선택: `L1499~L1566`
+11. 결과 반환 조립: `L1641~L1702`
+12. finally 정리: `L1703~L1724`
 
 ---
 
 ## 1) 실행 시작 & 작업 공간/샌드박스 결정
 
-핵심 흐름:
-1. `workspaceDir`를 사용자 경로로 해석하고 디렉터리 생성
-2. 세션키 기준으로 샌드박스 컨텍스트 결정(`resolveSandboxContext`)
-3. 실제 작업 디렉터리(`effectiveWorkspace`) 결정
-   - 샌드박스 RW 허용이면 원본 워크스페이스
-   - 제한 모드면 샌드박스 전용 디렉터리
-4. `process.chdir(effectiveWorkspace)`로 실행 컨텍스트 고정
+**코드 위치:** `L547~L572`
 
-의도:
-- 파일 접근 경계를 강제하고, 도구 실행/상대경로 해석을 일관되게 유지.
+```ts
+const resolvedWorkspace = resolveUserPath(params.workspaceDir);
+const runAbortController = new AbortController();
+...
+const sandbox = await resolveSandboxContext({ ... });
+const effectiveWorkspace = sandbox?.enabled
+  ? sandbox.workspaceAccess === "rw" ? resolvedWorkspace : sandbox.workspaceDir
+  : resolvedWorkspace;
+process.chdir(effectiveWorkspace);
+```
+
+핵심:
+- workspace 경로 정규화
+- sandbox 정책에 따라 실제 cwd 결정
+- 이후 모든 상대경로/도구 실행이 `effectiveWorkspace` 기준
 
 ---
 
 ## 2) 스킬/부트스트랩/컨텍스트 파일 주입
 
-핵심 흐름:
-- 런타임 스킬 엔트리 로드 여부 계산
-- 스킬 환경변수 오버라이드 적용 (`applySkillEnvOverrides*`)
-- 스킬 프롬프트 생성 (`resolveSkillsPromptForRun`)
-- 부트스트랩/컨텍스트 파일 해석 (`resolveBootstrapContextForRun`)
-- `BOOTSTRAP.md` 존재 시 “커밋 리마인더” 워크스페이스 노트 주입
+**코드 위치:** `L573~L610`
 
-의도:
-- 실행 단위마다 필요한 정책/문맥/메모 파일을 시스템 프롬프트에 안정적으로 반영.
+관련 함수:
+- `resolveEmbeddedRunSkillEntries`
+- `applySkillEnvOverridesFromSnapshot` / `applySkillEnvOverrides`
+- `resolveSkillsPromptForRun`
+- `resolveBootstrapContextForRun`
+
+```ts
+const { shouldLoadSkillEntries, skillEntries } = resolveEmbeddedRunSkillEntries(...);
+restoreSkillEnv = params.skillsSnapshot
+  ? applySkillEnvOverridesFromSnapshot(...)
+  : applySkillEnvOverrides(...);
+
+const skillsPrompt = resolveSkillsPromptForRun(...);
+const { bootstrapFiles, contextFiles } = await resolveBootstrapContextForRun(...);
+```
+
+핵심:
+- 런타임 스킬/부트스트랩 문맥을 프롬프트 생성 재료로 확보
+- 실행 종료 시 `restoreSkillEnv`로 환경 복구
 
 ---
 
 ## 3) 에이전트/툴 구성
 
-핵심 흐름:
-- 세션별 에이전트 ID 결정 (`resolveSessionAgentIds`)
-- FS 정책(`workspaceOnly`) 계산
-- 코어 도구 생성 (`createOpenClawCodingTools`) + 구글 제공자 호환 sanitize
-- 허용 툴명 집합 생성(`allowedToolNames`) → 이후 툴 호출 정규화에 사용
-- 채널(telegram/signal 등) 기능/액션/힌트/리액션 가이드 계산
+**코드 위치:** `L614~L737`
 
-의도:
-- 같은 코드 경로로도 세션/채널/제공자별 제약을 세밀하게 반영.
+관련 함수:
+- `resolveSessionAgentIds`
+- `createOpenClawCodingTools`
+- `sanitizeToolsForGoogle`
+- `collectAllowedToolNames`
+- `resolveChannelCapabilities`, `resolveTelegramInlineButtonsScope`
+
+```ts
+const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds(...);
+const toolsRaw = params.disableTools ? [] : createOpenClawCodingTools({ ... });
+const tools = sanitizeToolsForGoogle({ tools: toolsRaw, provider: params.provider });
+const allowedToolNames = collectAllowedToolNames({ tools, clientTools: params.clientTools });
+```
+
+핵심:
+- 세션/채널/모델 상태를 반영한 도구 집합 구성
+- `allowedToolNames`는 뒤에서 tool call name 정규화에 재사용
 
 ---
 
 ## 4) 시스템 프롬프트 빌드
 
-핵심 흐름:
-- 런타임 메타(호스트, OS, 모델, 쉘, 채널 capability 등) 수집
-- `buildEmbeddedSystemPrompt`로 최종 시스템 프롬프트 생성
-- `buildSystemPromptReport`로 디버깅/감사용 리포트 생성
-- 세션에 override 형태로 주입
+**코드 위치:** `L739~L827`
 
-포인트:
-- heartbeat 프롬프트, docs 경로, TTS 힌트, 툴 힌트, 메모 인용 모드까지 결합됨.
+관련 함수:
+- `buildSystemPromptParams`
+- `buildEmbeddedSystemPrompt`
+- `buildSystemPromptReport`
+- `createSystemPromptOverride`
+
+```ts
+const { runtimeInfo, userTimezone, userTime } = buildSystemPromptParams(...);
+const appendPrompt = buildEmbeddedSystemPrompt({ ..., tools, contextFiles, ... });
+const systemPromptReport = buildSystemPromptReport({ systemPrompt: appendPrompt, ... });
+let systemPromptText = createSystemPromptOverride(appendPrompt)();
+```
+
+핵심:
+- 런타임/채널/스킬/컨텍스트 파일 정보를 하나의 system prompt로 합성
+- report 객체로 추적 가능성 확보
 
 ---
 
 ## 5) 세션 파일 락 + 세션 매니저 초기화
 
-핵심 흐름:
-- 세션 파일 write lock 획득 (`acquireSessionWriteLock`)
-- 세션 파일 복구(`repairSessionFileIfNeeded`) 및 prewarm
-- `SessionManager`를 guard 래핑해 안전장치 적용
-- 런타임 준비(`prepareSessionManagerForRun`)
-- 필요 시 extension resource loader 생성/리로드
+**코드 위치:** `L829~L899`
 
-의도:
-- 동시성 충돌, 손상 세션, 불완전 tool result 상태를 방어.
+관련 함수:
+- `acquireSessionWriteLock`
+- `repairSessionFileIfNeeded`
+- `SessionManager.open` + `guardSessionManager`
+- `prepareSessionManagerForRun`
+- `buildEmbeddedExtensionFactories`
 
----
+```ts
+const sessionLock = await acquireSessionWriteLock({ ... });
+await repairSessionFileIfNeeded({ sessionFile: params.sessionFile, ... });
+sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), { ... });
+await prepareSessionManagerForRun({ sessionManager, ... });
+```
 
-## 6) Agent 세션 생성 & streamFn 파이프라인 구성
-
-핵심 흐름:
-1. `createAgentSession`으로 실제 agent session 생성
-2. 제공자별 스트림 함수 선택
-   - `ollama`: 네이티브 스트림 함수 사용
-   - `openai-responses + openai`: API 키 있으면 WebSocket, 없으면 HTTP fallback
-   - 그 외: `streamSimple`
-3. OpenAI-compatible Ollama 경로에서는 `num_ctx` 주입 래퍼 적용
-4. 추가 파라미터 적용(`applyExtraParamsToAgent`)
-5. 캐시 트레이스/Anthropic payload 로거 래핑
-6. transcript 정책 기반 방어 래퍼 체인:
-   - thinking 블록 제거
-   - tool call id sanitize
-   - OpenAI reasoning/function-call pair downgrade
-   - 툴명 공백 정규화 + tool call id 보정
-
-의도:
-- 모델/제공자별 포맷 제약 차이를 런타임에서 흡수해 실패율을 낮춤.
+핵심:
+- 동시성/세션 손상/tool-result 불일치에 대한 방어 지점
 
 ---
 
-## 7) 과거 히스토리 sanitize/검증/트렁케이션
+## 6) Agent 세션 생성 & streamFn 파이프라인
 
-핵심 흐름:
-- 세션 히스토리 sanitize
-- Gemini/Anthropic 턴 검증
-- DM 한도 기반 히스토리 컷
-- 컷 이후 tool_use/tool_result 짝 재보정
-- 최종 메시지로 세션 교체
+**코드 위치:** `L933~L1135`
 
-의도:
-- “히스토리가 이미 깨져있는 상태”를 최대한 복구하고, 모델 입력 형식을 맞춤.
+### 6-1. 세션 생성
+```ts
+({ session } = await createAgentSession({
+  model: params.model,
+  tools: builtInTools,
+  customTools: allCustomTools,
+  sessionManager,
+  ...
+}));
+```
 
----
+### 6-2. 제공자별 streamFn 선택
+```ts
+if (params.model.api === "ollama") {
+  activeSession.agent.streamFn = createOllamaStreamFn(ollamaBaseUrl);
+} else if (params.model.api === "openai-responses" && params.provider === "openai") {
+  activeSession.agent.streamFn = createOpenAIWebSocketStreamFn(...);
+} else {
+  activeSession.agent.streamFn = streamSimple;
+}
+```
 
-## 8) abort/timeout/구독(Subscription) 제어
+### 6-3. 래퍼 체인 (호환/안정화)
+- `wrapOllamaCompatNumCtx` (`L1011~L1030`)
+- `dropThinkingBlocks` 래핑 (`L1051~L1072`)
+- `sanitizeToolCallIdsForCloudCodeAssist` (`L1074~L1098`)
+- `downgradeOpenAIFunctionCallReasoningPairs` (`L1100~L1121`)
+- `wrapStreamFnTrimToolCallNames` (`L1123~L1129`)
 
-핵심 흐름:
-- 내부 `AbortController`와 외부 `abortSignal`을 연결
-- `abortable(promise)` 유틸로 주요 await를 abort 친화적으로 감쌈
-- `subscribeEmbeddedPiSession`으로 스트리밍 산출 수집
-  - assistant text, tool meta, usage, 메시지툴 전송 결과, cron 추가 결과 등
-- 전역 active run 레지스트리에 queue handle 등록
-- timeout 타이머에서 강제 중단 + compaction timeout 플래그 처리
-
-의도:
-- 긴 실행/재시도/컴팩션 중에도 중단 가능성과 관측 가능성 확보.
-
----
-
-## 9) 실제 프롬프트 실행
-
-핵심 흐름:
-1. `before_prompt_build`(및 레거시 `before_agent_start`) 훅 수행
-   - prepend context
-   - 시스템 프롬프트 override 가능
-2. 연속 user turn 방지(고아 user 메시지 정리)
-3. 처리 완료된 히스토리 이미지 정리
-4. 프롬프트 내 이미지 탐지/로딩 (`detectAndLoadPromptImages`)
-5. `activeSession.prompt(...)` 실행 (이미지 있으면 함께 전달)
-6. 오류는 `promptError`로 캡처하고 이후 플로우 유지
-
-의도:
-- 실행 직전 플러그인 개입 지점을 제공하면서도, 프롬프트 실패 시 후처리/정리를 계속 수행.
+핵심:
+- 모델별 포맷 차이/엄격 검증 이슈를 스트림 경계에서 흡수
 
 ---
 
-## 10) compaction 대기 & 캐시 TTL 처리
+## 7) 히스토리 sanitize/검증/트렁케이션
 
-핵심 흐름:
-- 프롬프트 직후 메시지 스냅샷 선캡처
-- `waitForCompactionRetry()` 대기
-- 컴팩션 도중 타임아웃 시 pre-compaction snapshot 우선 선택
-- cache-ttl 모드면 compaction 안정화 이후 타임스탬프 custom entry 추가
+**코드 위치:** `L1137~L1170`
 
-핵심 설계 의도:
-- compaction 경계에서 레이스/이중 compaction/불완전 스냅샷 문제를 회피.
+```ts
+const prior = await sanitizeSessionHistory({ ... });
+const validatedGemini = transcriptPolicy.validateGeminiTurns ? validateGeminiTurns(prior) : prior;
+const validated = transcriptPolicy.validateAnthropicTurns ? validateAnthropicTurns(validatedGemini) : validatedGemini;
+const truncated = limitHistoryTurns(validated, getDmHistoryLimitFromSessionKey(...));
+const limited = transcriptPolicy.repairToolUseResultPairing
+  ? sanitizeToolUseResultPairing(truncated)
+  : truncated;
+activeSession.agent.replaceMessages(limited);
+```
 
----
-
-## 11) 결과 조립 & 훅 후처리
-
-반환값(요지):
-- 실행 상태: `aborted`, `timedOut`, `timedOutDuringCompaction`, `promptError`
-- 대화 결과: `messagesSnapshot`, `assistantTexts`, `lastAssistant`
-- 도구/전송 결과: `toolMetas`, `lastToolError`, 메시지툴 전송 텍스트/미디어/대상, `didSendViaMessagingTool`
-- 운영 신호: `attemptUsage`, `compactionCount`, `successfulCronAdds`
-- 기타: `systemPromptReport`, `clientToolCall`, CloudCodeAssist 포맷 오류 플래그
-
-그리고 `llm_output`/`agent_end` 훅을 비동기 후처리로 호출.
+핵심:
+- “과거 메시지가 이미 깨진 상태”를 실행 직전에 최대한 정리
 
 ---
 
-## 12) finally 정리(아주 중요)
+## 8) Abort/Timeout/Subscription 제어
 
-항상 실행되는 정리:
-- 구독 해제
-- active run 레지스트리 해제
-- pending tool result flush(Idle 대기 후)
-- 세션 dispose
-- OpenAI WS 세션 해제
-- 세션 락 release
-- 스킬 env 복원
-- `cwd` 원복
+**코드 위치:** `L1179~L1341`
 
-의도:
-- 실패/중단/타임아웃에서도 리소스 누수와 세션 오염을 막는 마지막 안전망.
+관련 함수:
+- `abortRun`, `abortable`
+- `subscribeEmbeddedPiSession`
+- `setActiveEmbeddedRun`
+- `shouldFlagCompactionTimeout`
+
+```ts
+const abortRun = (isTimeout = false, reason?: unknown) => { ... void activeSession.abort(); };
+const subscription = subscribeEmbeddedPiSession({ session: activeSession, ... });
+setActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
+const abortTimer = setTimeout(() => { ... abortRun(true); }, Math.max(1, params.timeoutMs));
+```
+
+핵심:
+- 실행 중단/타임아웃/컴팩션 타임아웃을 구분해서 상태 관리
 
 ---
 
-## 구조적 관점에서 본 핵심 포인트 5개
+## 9) 프롬프트 실행 본체
 
-1. **오케스트레이션 중심 함수**
-   - 단일 비즈니스 로직보다 “실행 수명주기 관리”에 초점.
+**코드 위치:** `L1346~L1497`
 
-2. **방어적 래핑 체인**
-   - streamFn에 여러 sanitize/compat 래퍼를 계층적으로 적용해 제공자별 실패를 런타임에서 흡수.
+관련 함수:
+- `resolvePromptBuildHookResult`
+- `pruneProcessedHistoryImages`
+- `detectAndLoadPromptImages`
+- `activeSession.prompt`
 
-3. **세션 무결성 우선**
-   - 락, 파일 복구, 히스토리 정리, flush-after-idle로 tool/result 불일치 리스크 최소화.
+```ts
+const hookResult = await resolvePromptBuildHookResult({ ... });
+if (hookResult?.prependContext) effectivePrompt = `${hookResult.prependContext}\n\n${params.prompt}`;
+...
+const imageResult = await detectAndLoadPromptImages({ prompt: effectivePrompt, ... });
+await abortable(activeSession.prompt(effectivePrompt, imageResult.images.length > 0 ? { images: imageResult.images } : undefined));
+```
 
-4. **관측 가능성(Observability) 내장**
-   - cache trace, payload logger, usage/compaction 카운트, hook 이벤트로 사후 분석 가능.
+핵심:
+- 훅 기반 프롬프트 변형 + 이미지 로딩 + 실제 모델 호출
 
-5. **컴팩션 경계 처리의 정교함**
-   - 타임아웃·레이스 상황에서 snapshot 선택 전략을 분리해 결과 일관성을 지키는 설계.
+---
+
+## 10) Compaction 대기 & 스냅샷 선택
+
+**코드 위치:** `L1499~L1566`
+
+관련 함수:
+- `waitForCompactionRetry`
+- `appendCacheTtlTimestamp`
+- `selectCompactionTimeoutSnapshot`
+
+```ts
+const preCompactionSnapshot = wasCompactingBefore || wasCompactingAfter ? null : snapshot;
+await abortable(waitForCompactionRetry());
+...
+const snapshotSelection = selectCompactionTimeoutSnapshot({
+  timedOutDuringCompaction,
+  preCompactionSnapshot,
+  currentSnapshot: activeSession.messages.slice(),
+  ...
+});
+messagesSnapshot = snapshotSelection.messagesSnapshot;
+```
+
+핵심:
+- compaction 경계에서 레이스가 나도 일관된 결과 스냅샷 선택
+
+---
+
+## 11) 결과 조립 & 반환
+
+**코드 위치:** `L1641~L1702`
+
+```ts
+const lastAssistant = messagesSnapshot.slice().toReversed().find((m) => m.role === "assistant");
+...
+return {
+  aborted,
+  timedOut,
+  timedOutDuringCompaction,
+  promptError,
+  systemPromptReport,
+  messagesSnapshot,
+  assistantTexts,
+  toolMetas: toolMetasNormalized,
+  ...
+};
+```
+
+핵심:
+- 실행 결과 + 관측 데이터 + 메시징/툴 실행 결과를 한 객체로 반환
+
+---
+
+## 12) finally 정리 (누수 방지 핵심)
+
+**코드 위치:** `L1703~L1724`
+
+```ts
+removeToolResultContextGuard?.();
+await flushPendingToolResultsAfterIdle({ agent: session?.agent, sessionManager });
+session?.dispose();
+releaseWsSession(params.sessionId);
+await sessionLock.release();
+...
+restoreSkillEnv?.();
+process.chdir(prevCwd);
+```
+
+핵심:
+- 실패/중단/타임아웃 여부와 무관하게 세션 락/리소스/cwd/env를 복구
+
+---
+
+## 참고: 같이 보면 좋은 내부 함수
+
+- 같은 파일 상단 helper
+  - `wrapOllamaCompatNumCtx`
+  - `wrapStreamFnTrimToolCallNames`
+  - `resolvePromptBuildHookResult`
+  - `resolveAttemptFsWorkspaceOnly`
+- 인접 모듈
+  - `./compaction-timeout.ts`
+  - `./images.ts`
+  - `../system-prompt.ts`
+  - `../google.ts`
 
 ---
 
 ## 결론
-`runEmbeddedAttempt`는 OpenClaw 임베디드 러너의 **실질적인 실행 커널**이다.
-단순히 “프롬프트 한 번 호출”이 아니라,
-- 세션/도구/프롬프트/모델별 호환성
-- 중단/타임아웃/컴팩션/히스토리 손상
-- 후킹/로깅/운영 신호
-를 한 지점에서 통합 제어하는 고신뢰 실행 파이프라인으로 설계되어 있다.
+이 함수는 “LLM 호출 함수”가 아니라,
+**세션/툴/프롬프트/중단/컴팩션/호환성/정리**를 한 번에 다루는 실행 오케스트레이터다.
+
+원하면 다음 버전에서 섹션별로 **GitHub 라인 앵커 링크(`#Lxxx-Lyyy`)**를 전부 붙여서,
+클릭하면 해당 코드로 바로 점프되게 정리해줄게.
