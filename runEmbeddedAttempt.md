@@ -327,6 +327,110 @@ activeSession.agent.replaceMessages(limited);
 핵심:
 - “과거 메시지가 이미 깨진 상태”를 실행 직전에 최대한 정리
 
+### 어떤 상태를 "깨진 히스토리"라고 보나? (데이터 예시)
+
+아래는 실제로 provider에서 오류를 유발할 수 있는 대표 패턴들이다.
+
+#### 예시 A) `tool_result`가 있는데 대응 `tool_use/toolCall`이 없음
+
+```json
+[
+  { "role": "user", "content": "파일 읽어줘" },
+  {
+    "role": "tool",
+    "content": [
+      { "type": "tool_result", "tool_use_id": "call_abc", "content": "..." }
+    ]
+  }
+]
+```
+
+문제:
+- 모델 입장에서는 `call_abc`를 호출한 assistant 턴이 없어서 체인이 끊김.
+
+정리 단계:
+- `sanitizeSessionHistory(...)`
+- 필요 시 `sanitizeToolUseResultPairing(...)`로 짝 맞춤/정리
+
+#### 예시 B) 반대로 `tool_use`는 있는데 결과가 누락됨
+
+```json
+[
+  {
+    "role": "assistant",
+    "content": [
+      { "type": "tool_use", "id": "call_123", "name": "read", "input": { "path": "a.txt" } }
+    ]
+  },
+  { "role": "assistant", "content": "다음으로 진행할게" }
+]
+```
+
+문제:
+- tool 실행 결과 없이 다음 assistant 턴으로 넘어가면 provider가 role/order 규칙 위반으로 거부할 수 있음.
+
+정리 단계:
+- guard/sanitize 단계에서 누락을 보정하거나 잘못된 블록을 제거
+
+#### 예시 C) 제공자 포맷 제약과 맞지 않는 tool call ID
+
+```json
+{
+  "type": "toolCall",
+  "id": "call-with-invalid-format-!!!",
+  "name": "read"
+}
+```
+
+문제:
+- 일부 제공자(예: 엄격한 Cloud Code Assist 계열/일부 Mistral 경로)는 ID 포맷을 강제함.
+
+정리 단계:
+- `sanitizeSessionHistory(...)` + stream 래퍼에서
+  `sanitizeToolCallIdsForCloudCodeAssist(...)` 적용
+
+#### 예시 D) 턴 순서 자체가 비정상 (연속 user/연속 tool 등)
+
+```json
+[
+  { "role": "user", "content": "A" },
+  { "role": "user", "content": "B" },
+  { "role": "tool", "content": "..." }
+]
+```
+
+문제:
+- 모델별 role 전이 규칙(assistant→tool→assistant 등)에 어긋남.
+
+정리 단계:
+- `validateGeminiTurns(...)`, `validateAnthropicTurns(...)`에서 검증/정돈
+
+#### 예시 E) 히스토리 컷 이후 발생하는 "고아 tool_result"
+
+```json
+// 컷 전
+assistant(tool_use call_77) -> tool(tool_result call_77)
+
+// limitHistoryTurns 이후 (앞부분 삭제)
+tool(tool_result call_77)   // tool_use가 잘려나감
+```
+
+문제:
+- 트렁케이션 자체는 정상인데, 잘린 결과로 짝이 깨질 수 있음.
+
+정리 단계:
+- 코드가 의도적으로 트렁케이션 후
+  `sanitizeToolUseResultPairing(truncated)`를 한 번 더 수행함.
+
+### 왜 sanitize → validate → truncate → re-pair 순서인가?
+
+1. **sanitize**: 먼저 구조적 오염 제거
+2. **validate**: 제공자 규칙(Gemini/Anthropic 턴 규칙) 확인
+3. **truncate**: 토큰/히스토리 한도 맞춤
+4. **re-pair**: 자르면서 새로 생긴 orphan(tool_use/tool_result) 재정리
+
+즉, "한 번 정리하면 끝"이 아니라, **트렁케이션이 새 오류를 만들 수 있어서 마지막 재정리 단계가 꼭 필요**한 구조다.
+
 ---
 
 ## 8) Abort/Timeout/Subscription 제어
