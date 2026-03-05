@@ -630,30 +630,147 @@ if (imageResult.images.length > 0) {
 
 ---
 
-## 10) Compaction 대기 & 스냅샷 선택
+## 10) Compaction 대기 & 스냅샷 선택 (상세)
 
 **코드 위치:** `L1499~L1566`
 
 관련 함수:
 - `waitForCompactionRetry`
+- `isRunnerAbortError`
+- `shouldFlagCompactionTimeout`
 - `appendCacheTtlTimestamp`
+- `isCacheTtlEligibleProvider`
 - `selectCompactionTimeoutSnapshot`
 
+### 10-1) 왜 프롬프트 직후에 즉시 스냅샷을 뜨나
+
 ```ts
+const wasCompactingBefore = activeSession.isCompacting;
+const snapshot = activeSession.messages.slice();
+const wasCompactingAfter = activeSession.isCompacting;
 const preCompactionSnapshot = wasCompactingBefore || wasCompactingAfter ? null : snapshot;
-await abortable(waitForCompactionRetry());
-...
-const snapshotSelection = selectCompactionTimeoutSnapshot({
-  timedOutDuringCompaction,
-  preCompactionSnapshot,
-  currentSnapshot: activeSession.messages.slice(),
-  ...
-});
-messagesSnapshot = snapshotSelection.messagesSnapshot;
+const preCompactionSessionId = activeSession.sessionId;
+```
+
+핵심 의도:
+- compaction 대기 중 timeout이 나면, 그 시점의 세션 상태가 불안정할 수 있다.
+- 그래서 **compaction에 들어가기 전의 깨끗한 후보 스냅샷**을 먼저 확보.
+
+레이스 방지 포인트:
+- `isCompacting`를 before/after 두 번 읽어서,
+  캡처 중 compaction이 시작된 케이스를 `preCompactionSnapshot = null`로 버린다.
+
+### 10-2) compaction 재시도 대기와 abort 처리
+
+```ts
+try {
+  await abortable(waitForCompactionRetry());
+} catch (err) {
+  if (isRunnerAbortError(err)) {
+    if (!promptError) {
+      promptError = err;
+      promptErrorSource = "compaction";
+    }
+    log.debug(`compaction wait aborted ...`);
+  } else {
+    throw err;
+  }
+}
 ```
 
 핵심:
-- compaction 경계에서 레이스가 나도 일관된 결과 스냅샷 선택
+- compaction/retry 파트도 `abortable(...)`로 감싸서 timeout/외부 abort를 즉시 반영.
+- abort 계열 에러는 런 전체 실패로 즉시 던지지 않고 `promptErrorSource="compaction"`로 표식.
+- 비-abort 예외는 진짜 이상 상황으로 간주하고 rethrow.
+
+### 10-3) 이번 attempt에서 compaction이 실제로 발생했는지 체크
+
+```ts
+const compactionOccurredThisAttempt = getCompactionCount() > 0;
+```
+
+의미:
+- 뒤에서 cache-ttl 타임스탬프를 넣을지 판단할 때 사용.
+- 이미 compaction이 일어난 attempt라면 추가 custom entry 삽입 타이밍에 더 보수적으로 동작.
+
+### 10-4) cache-ttl 타임스탬프를 "compaction 이후"에 넣는 이유
+
+```ts
+if (!timedOutDuringCompaction && !compactionOccurredThisAttempt) {
+  const shouldTrackCacheTtl =
+    params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl" &&
+    isCacheTtlEligibleProvider(params.provider, params.modelId);
+
+  if (shouldTrackCacheTtl) {
+    appendCacheTtlTimestamp(sessionManager, {
+      timestamp: Date.now(),
+      provider: params.provider,
+      modelId: params.modelId,
+    });
+  }
+}
+```
+
+핵심 배경:
+- 코드 주석대로, 과거엔 프롬프트 전에 타임스탬프를 넣다가 compaction guard를 깨서
+  이중 compaction 문제가 있었음.
+- 현재는 **prompt + compaction retry 이후**로 옮겨서 안전하게 기록.
+- 또한 compaction 도중 timeout이 나면 세션 일관성이 의심되므로 기록 스킵.
+
+### 10-5) 최종 스냅샷 선택 로직
+
+```ts
+const snapshotSelection = selectCompactionTimeoutSnapshot({
+  timedOutDuringCompaction,
+  preCompactionSnapshot,
+  preCompactionSessionId,
+  currentSnapshot: activeSession.messages.slice(),
+  currentSessionId: activeSession.sessionId,
+});
+
+messagesSnapshot = snapshotSelection.messagesSnapshot;
+sessionIdUsed = snapshotSelection.sessionIdUsed;
+```
+
+선택 원리:
+- 정상 케이스: 대기 이후 `currentSnapshot` 사용
+- compaction timeout 케이스: 가능하면 `preCompactionSnapshot` 우선
+- 어떤 스냅샷을 썼는지 `source`를 경고 로그로 남김
+
+왜 중요한가:
+- compaction은 메시지 구조를 재배열할 수 있으므로,
+  타임아웃 경계에서 잘못 잡으면 assistant/tool 메타가 어긋난 결과를 리턴할 수 있음.
+
+### 10-6) promptError 영속화와 관측 데이터 기록
+
+```ts
+if (promptError && promptErrorSource === "prompt" && !compactionOccurredThisAttempt) {
+  sessionManager.appendCustomEntry("openclaw:prompt-error", { ... });
+}
+
+cacheTrace?.recordStage("session:after", {
+  messages: messagesSnapshot,
+  note: timedOutDuringCompaction ? "compaction timeout" : promptError ? "prompt error" : undefined,
+});
+anthropicPayloadLogger?.recordUsage(messagesSnapshot, promptError);
+```
+
+포인트:
+- prompt 단계 오류를 세션에 custom entry로 남겨 재현/디버깅 가능성 확보.
+- compaction이 일어난 시도에서는 기록 타이밍 충돌을 피하려고 보수적으로 처리.
+- 최종 스냅샷 기준으로 trace/usage를 남겨 "실제로 반환된 상태"와 로그를 맞춤.
+
+### 10-7) 이 블록의 실행 순서 요약
+
+1. compaction 직전 후보 스냅샷 캡처 (레이스 체크 포함)
+2. `waitForCompactionRetry()` 대기 (abortable)
+3. compaction 발생 여부 확인
+4. 필요 시 cache-ttl 타임스탬프 기록
+5. timeout 여부를 반영해 최종 스냅샷 선택
+6. trace/usage/prompt-error 메타 기록
+
+즉 10번은 단순 대기가 아니라,
+**compaction 경계의 불안정 구간에서 결과 일관성을 지키기 위한 안정화 블록**이다.
 
 ---
 
