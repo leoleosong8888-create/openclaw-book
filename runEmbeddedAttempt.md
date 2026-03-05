@@ -455,26 +455,178 @@ const abortTimer = setTimeout(() => { ... abortRun(true); }, Math.max(1, params.
 
 ---
 
-## 9) 프롬프트 실행 본체
+## 9) 프롬프트 실행 본체 (상세)
 
 **코드 위치:** `L1346~L1497`
 
 관련 함수:
 - `resolvePromptBuildHookResult`
+- `applySystemPromptOverrideToSession`
 - `pruneProcessedHistoryImages`
 - `detectAndLoadPromptImages`
+- `summarizeSessionContext`
 - `activeSession.prompt`
+- `abortable`
+
+### 9-0) 실행 컨텍스트 변수 초기화
 
 ```ts
-const hookResult = await resolvePromptBuildHookResult({ ... });
-if (hookResult?.prependContext) effectivePrompt = `${hookResult.prependContext}\n\n${params.prompt}`;
-...
-const imageResult = await detectAndLoadPromptImages({ prompt: effectivePrompt, ... });
-await abortable(activeSession.prompt(effectivePrompt, imageResult.images.length > 0 ? { images: imageResult.images } : undefined));
+let promptError: unknown = null;
+let promptErrorSource: "prompt" | "compaction" | null = null;
+const promptStartedAt = Date.now();
+let effectivePrompt = params.prompt;
+```
+
+포인트:
+- 이 블록은 실패를 즉시 throw하지 않고 `promptError`로 보관한 뒤,
+  뒤의 compaction/snapshot/후처리까지 진행할 수 있게 설계됨.
+
+### 9-1) before_prompt_build 훅으로 프롬프트/시스템프롬프트 가변 처리
+
+```ts
+const hookResult = await resolvePromptBuildHookResult({
+  prompt: params.prompt,
+  messages: activeSession.messages,
+  hookCtx,
+  hookRunner,
+  legacyBeforeAgentStartResult: params.legacyBeforeAgentStartResult,
+});
+
+if (hookResult?.prependContext) {
+  effectivePrompt = `${hookResult.prependContext}\n\n${params.prompt}`;
+}
+
+const legacySystemPrompt =
+  typeof hookResult?.systemPrompt === "string" ? hookResult.systemPrompt.trim() : "";
+if (legacySystemPrompt) {
+  applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
+  systemPromptText = legacySystemPrompt;
+}
+```
+
+포인트:
+- `prependContext`는 user prompt 앞에 동적으로 문맥을 붙임.
+- `systemPrompt` override가 오면 **이번 attempt의 시스템 프롬프트를 교체**.
+- 즉, 플러그인이 "입력 텍스트"와 "시스템 규칙" 둘 다 개입 가능.
+
+### 9-2) 고아 user 턴 정리 (role 순서 위반 방지)
+
+```ts
+const leafEntry = sessionManager.getLeafEntry();
+if (leafEntry?.type === "message" && leafEntry.message.role === "user") {
+  if (leafEntry.parentId) sessionManager.branch(leafEntry.parentId);
+  else sessionManager.resetLeaf();
+
+  const sessionContext = sessionManager.buildSessionContext();
+  activeSession.agent.replaceMessages(sessionContext.messages);
+}
+```
+
+왜 필요하나:
+- 마지막 leaf가 `user`면, 지금 새 prompt까지 들어가며 user가 연속될 수 있음.
+- provider에 따라 role ordering 오류가 발생하므로, 실행 직전 leaf를 안전한 지점으로 되돌림.
+
+### 9-3) 히스토리 이미지 정리 (idempotent cleanup)
+
+```ts
+const didPruneImages = pruneProcessedHistoryImages(activeSession.messages);
+if (didPruneImages) {
+  activeSession.agent.replaceMessages(activeSession.messages);
+}
+```
+
+포인트:
+- 이미 처리 완료된 과거 이미지 블록이 남아있으면 제거.
+- 매 실행 호출해도 안전(idempotent)하도록 설계됨.
+
+### 9-4) 프롬프트 내 이미지 탐지/로딩 + 샌드박스 경계 적용
+
+```ts
+const imageResult = await detectAndLoadPromptImages({
+  prompt: effectivePrompt,
+  workspaceDir: effectiveWorkspace,
+  model: params.model,
+  existingImages: params.images,
+  maxBytes: MAX_IMAGE_BYTES,
+  maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
+  workspaceOnly: effectiveFsWorkspaceOnly,
+  sandbox:
+    sandbox?.enabled && sandbox?.fsBridge
+      ? { root: sandbox.workspaceDir, bridge: sandbox.fsBridge }
+      : undefined,
+});
 ```
 
 핵심:
-- 훅 기반 프롬프트 변형 + 이미지 로딩 + 실제 모델 호출
+- 프롬프트 텍스트에서 이미지 참조를 찾아 실제 입력 payload로 변환.
+- 크기/해상도 제한 적용.
+- 샌드박스 모드면 파일 접근 루트를 강제해서 경계 밖 참조 차단.
+
+### 9-5) context 진단 로그 + llm_input 훅
+
+```ts
+const sessionSummary = summarizeSessionContext(activeSession.messages);
+log.debug(`[context-diag] ... historyTextChars=${sessionSummary.totalTextChars} ...`);
+
+if (hookRunner?.hasHooks("llm_input")) {
+  hookRunner.runLlmInput({
+    runId: params.runId,
+    sessionId: params.sessionId,
+    provider: params.provider,
+    model: params.modelId,
+    systemPrompt: systemPromptText,
+    prompt: effectivePrompt,
+    historyMessages: activeSession.messages,
+    imagesCount: imageResult.images.length,
+  }, ...).catch(...);
+}
+```
+
+포인트:
+- 실제 호출 직전 컨텍스트 길이/이미지 수 등을 기록해 overflow 분석 가능.
+- `llm_input` 훅은 fire-and-forget이라 실행 흐름을 막지 않음.
+
+### 9-6) 실제 모델 호출 (`activeSession.prompt`) + abort 래핑
+
+```ts
+if (imageResult.images.length > 0) {
+  await abortable(activeSession.prompt(effectivePrompt, { images: imageResult.images }));
+} else {
+  await abortable(activeSession.prompt(effectivePrompt));
+}
+```
+
+핵심:
+- 이미지가 있을 때만 `images` 옵션 전달 (모델 호환성 이슈 예방).
+- `abortable(...)`로 감싸서 timeout/외부 abort가 오면 즉시 중단 가능.
+
+### 9-7) 오류 처리 방식 (중요)
+
+```ts
+} catch (err) {
+  promptError = err;
+  promptErrorSource = "prompt";
+} finally {
+  log.debug(`embedded run prompt end ... durationMs=...`);
+}
+```
+
+설계 의도:
+- 프롬프트 실패를 바로 throw하지 않고 `promptError`로 보관.
+- 이후 단계(compaction 대기, snapshot 확보, hook 후처리, 결과 반환)까지 수행해
+  관측성과 복구 가능성을 높임.
+
+### 9-8) 이 블록의 실제 실행 순서 요약
+
+1. 훅으로 prompt/systemPrompt 수정
+2. 세션 leaf 정리(연속 user turn 방지)
+3. 과거 이미지 블록 청소
+4. prompt 내 이미지 로딩(+제한/샌드박스 체크)
+5. context 진단 로그/llm_input 훅
+6. `activeSession.prompt(...)` 실제 호출 (abortable)
+7. 실패 시 `promptError` 기록 후 종료 로그
+
+즉, 9번 섹션은 단순 호출이 아니라 **"호출 전 정합성 확보 + 호출 + 호출 실패를 다음 단계로 연결"**하는 실행 중심 블록이다.
 
 ---
 
