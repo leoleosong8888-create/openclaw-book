@@ -5,6 +5,7 @@
 
 - openClaw
   - [agents/pi-embedded-runner/run/attempt.ts](runEmbeddedAttempt.md)
+  - [agents/pi-embedded-runner/run.ts](run.ts-after-attempt.md)
 
 - 날씨
   - [📊 한국 날씨 그래프](weather-dashboard.md)
