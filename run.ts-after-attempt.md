@@ -74,19 +74,125 @@ autoCompactionCount += Math.max(0, attempt.compactionCount ?? 0);
 
 ## assistant 응답 기반 후처리 (`L1160~L1277`)
 
-prompt 단계 오류가 없으면, 이번엔 assistant 결과를 보고 처리:
+이 구간은 한마디로 **"assistant 결과를 보고 복구 전략을 고르는 라우팅 레이어"**다.
 
-- thinking fallback 재판단 (`L1160~L1170`)
-- auth/rate limit/billing/failover 에러 분류 (`L1172~L1176`)
-- 이미지 dimension 오류 로그 (`L1178~L1207`)
-- profile 회전 조건 계산:
-  - failover성 assistant 실패 또는
-  - timeout(단, compaction timeout 제외) (`L1209~L1213`)
-- 회전 가능하면 다음 profile로 `continue` (`L1237~L1240`)
-- profile 소진 + fallback 구성 시 `FailoverError` throw (`L1242~L1276`)
+`promptError` 단계는 통과했더라도, assistant 응답 내용(에러 텍스트/타임아웃/정책 실패)을 분석해
+- 현재 profile에서 한 번 더 해볼지,
+- 다른 profile로 넘길지,
+- 아니면 상위 failover 체인으로 승격할지
+를 결정한다.
 
-핵심:
-- run.ts는 단일 모델 실행기가 아니라 **프로필 로테이션 + failover 브릿지** 역할을 함.
+### 0) 왜 이 단계가 따로 필요한가
+
+`runEmbeddedAttempt(...)` 결과에는 "실패"만 있는 게 아니라 실패의 성격이 섞여 있다.
+예를 들어:
+- 같은 timeout이라도 일시적 네트워크 지연인지,
+- compaction 과정의 timeout인지,
+- 인증/과금 같은 구조적 실패인지에 따라
+복구 방식이 완전히 달라진다.
+
+그래서 여기서 **실패를 재분류**하고 **복구 우선순위**를 정한다.
+
+---
+
+### 1) thinking fallback 재판단 (`L1160~L1170`)
+
+이전 분기(promptError)에서 이미 thinking fallback을 검토했더라도,
+assistant 응답의 실제 에러 신호를 보고 한 번 더 판단한다.
+
+의미:
+- 사전 판단(prompt 단계) + 사후 판단(assistant 단계) 이중 안전장치
+- 잘못된 thinking 레벨로 인한 불필요한 실패를 줄임
+
+즉, "한 번 본 걸 다시 본다"가 아니라,
+**다른 관측치(assistant 결과)를 기반으로 재평가**하는 단계다.
+
+---
+
+### 2) assistant 에러 클래스 분류 (`L1172~L1176`)
+
+assistant 실패를 운영 관점에서 중요한 카테고리로 분해한다.
+
+대표 분류:
+- auth 계열
+- rate limit 계열
+- billing/quota 계열
+- failover 후보 에러
+
+이 분류값은 뒤의 핵심 분기(프로필 회전 여부, FailoverError throw 여부)에 직접 사용된다.
+
+핵심 포인트:
+- 단순 문자열 비교가 아니라,
+- "재시도로 회복 가능한지" vs "경로를 바꿔야 하는지"를 가르는 용도.
+
+---
+
+### 3) 이미지 dimension 오류 처리 강화 (`L1178~L1207`)
+
+이미지 크기/차원 관련 오류는 사용자 입력 문제일 수도, 모델 제한 문제일 수도 있다.
+이 구간에서 해당 케이스를 별도로 기록/진단해 이후 분석 가능성을 높인다.
+
+효과:
+- 동일 오류 재발 시 원인 추적이 빨라짐
+- "왜 실패했는지"를 운영 로그에서 분리해 확인 가능
+
+---
+
+### 4) profile 회전 트리거 계산 (`L1209~L1213`)
+
+다음 profile로 넘어가야 하는지 계산한다. 주된 조건은:
+
+1. failover 성격의 assistant 실패
+2. timeout 발생
+   - 단, **compaction timeout은 제외**
+
+`compaction timeout`을 제외하는 이유:
+- compaction은 복구 시도 자체라서, 이를 일반 모델 실패로 간주하면 profile을 과도하게 소모할 수 있음
+- 즉, **복구 단계의 지연**과 **실행 경로 자체의 실패**를 구분함
+
+---
+
+### 5) 회전 가능하면 즉시 다음 profile로 continue (`L1237~L1240`)
+
+현재 profile을 붙잡고 같은 실패를 반복하지 않고,
+가능한 경우 바로 다음 auth profile로 넘어가 재시도한다.
+
+의미:
+- 장애 profile에 대한 체류 시간 감소
+- 사용자 관점에서 성공 확률/응답성 개선
+
+`run.ts`가 "단순 재시도 루프"가 아니라
+**프로필 로테이터** 역할을 수행하는 지점이다.
+
+---
+
+### 6) profile 소진 시 상위 failover로 승격 (`L1242~L1276`)
+
+모든 profile을 소진했는데도 회복되지 않으면,
+로컬(profile 단위) 복구를 종료하고 `FailoverError`를 throw한다.
+
+그러면 상위 계층이 모델/provider 레벨 failover를 수행할 수 있다.
+
+계층 구조로 보면:
+- 현재 구간: profile 레벨 복구
+- 상위 핸들러: 모델/provider 레벨 복구
+
+즉, **로컬에서 할 수 있는 건 다 한 뒤 상위로 책임을 넘기는 경계점**이다.
+
+---
+
+### 이 구간의 전체 흐름(요약)
+
+1. assistant 결과 재해석
+2. thinking 조정 필요성 재판단
+3. 에러 타입 분류(auth/rate/billing/failover)
+4. profile 회전 여부 판정(타임아웃/실패 성격 기반)
+5. 회전 가능 시 즉시 다음 profile
+6. profile 소진 시 `FailoverError`로 상위 체인 진입
+
+한 줄로 정리하면,
+`L1160~L1277`은 **assistant 결과 기반의 복구 폭 확장 단계**다.
+(동일 profile 재시도 → profile 회전 → 상위 failover 승격)
 
 ---
 
