@@ -12,6 +12,9 @@
 - langChain
   - [LangChain 소개](langchain.md)
 
+- langGraph
+  - [LangGraph 소개](langgraph.md)
+
 - 날씨
   - [📊 한국 날씨 그래프](weather-dashboard.md)
 
