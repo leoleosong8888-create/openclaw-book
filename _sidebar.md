@@ -4,6 +4,8 @@
   - [AI와 LLM 지도](00-ai-llm-for-grade6.md)
 
 - openClaw
+  - agents/pi-embedded-subscribe.ts
+    - [개요 및 동작 분석](pi-embedded-subscribe.md)
   - [agents/pi-embedded-runner/run/attempt.ts](runEmbeddedAttempt.md)
   - [agents/pi-embedded-runner/run.ts](run.ts-after-attempt.md)
 
