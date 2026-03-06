@@ -210,6 +210,106 @@ const agentMeta = { sessionId, provider, model, usage, lastCallUsage, promptToke
 ### 2) 최종 payload 생성 (`L1300~L1315`)
 - `buildEmbeddedRunPayloads(...)`로 assistant text/tool 메타를 사용자 응답 포맷으로 변환
 
+#### `buildEmbeddedRunPayloads(...)` 파라미터와 역할
+
+`run.ts`에서는 대략 아래 형태로 호출한다.
+
+```ts
+const payloads = buildEmbeddedRunPayloads({
+  assistantTexts: attempt.assistantTexts,
+  toolMetas: attempt.toolMetas,
+  lastAssistant: attempt.lastAssistant,
+  lastToolError: attempt.lastToolError,
+  config: params.config,
+  sessionKey: params.sessionKey ?? params.sessionId,
+  provider: activeErrorContext.provider,
+  model: activeErrorContext.model,
+  verboseLevel: params.verboseLevel,
+  reasoningLevel: params.reasoningLevel,
+  toolResultFormat: resolvedToolResultFormat,
+  suppressToolErrorWarnings: params.suppressToolErrorWarnings,
+  inlineToolResultsAllowed: false,
+  didSendViaMessagingTool: attempt.didSendViaMessagingTool,
+});
+```
+
+각 파라미터의 의미:
+
+- `assistantTexts`
+  - 스트리밍 구독 단계에서 누적된 assistant 본문 텍스트 배열.
+  - **최종 답변 텍스트의 1순위 소스**.
+
+- `lastAssistant`
+  - 세션 스냅샷에서 찾은 마지막 assistant 메시지 객체.
+  - 에러 포맷팅(`formatAssistantErrorText`), usage/model/provider 보정,
+    그리고 `assistantTexts`가 비었을 때 fallback 본문(`extractAssistantText`)에 사용.
+
+- `toolMetas`
+  - 도구 호출 요약 메타(도구명/메타).
+  - 설정에 따라 payload에 도구 실행 결과 요약 텍스트를 포함할 때 사용.
+
+- `lastToolError`
+  - 마지막 도구 오류 정보.
+  - user-facing 경고를 붙일지, 상세 오류를 노출할지 정책 판단에 사용.
+
+- `config`, `sessionKey`, `provider`, `model`
+  - 에러 문구를 사용자 친화적으로 정규화할 때 컨텍스트로 사용.
+  - provider/model별 billing/auth 문구 분기에도 관여.
+
+- `verboseLevel`, `reasoningLevel`, `toolResultFormat`
+  - 응답 표현 방식 제어 파라미터.
+  - 예: reasoning 표시 여부, tool 결과 요약 노출 수준, markdown/plain 포맷 선택.
+
+- `suppressToolErrorWarnings`
+  - tool 실패 경고 메시지를 suppress할지 제어.
+
+- `inlineToolResultsAllowed`
+  - tool 결과를 assistant 답변 본문에 인라인으로 섞어 넣을지 여부.
+  - 이 구간 호출에서는 `false`로 내려서 과도한 노출을 제한.
+
+- `didSendViaMessagingTool`
+  - 이미 message tool로 외부 전송이 일어났는지 판단하는 보조 신호.
+  - 중복 사용자 노출을 줄이는 쪽의 정책 판단에 간접적으로 활용.
+
+#### 내부 처리 흐름(핵심)
+
+`buildEmbeddedRunPayloads` 내부는 대략 다음 순서로 동작한다.
+
+1. **assistant 에러 상태 계산**
+   - `lastAssistant.stopReason === "error"` 여부 확인
+   - `formatAssistantErrorText(...)`로 사용자 친화 에러 텍스트 생성
+
+2. **raw 에러 중복 억제 준비**
+   - raw error / formatted error fingerprint를 만들고,
+   - 동일 문구 반복 노출을 방지하는 suppression 기준 구축
+
+3. **tool meta 기반 reply item 추가(옵션)**
+   - inline 허용 + verbose 조건을 만족할 때만 tool 요약 삽입
+
+4. **reasoning 텍스트 추가(옵션)**
+   - `reasoningLevel === "on"`일 때 thinking 블록을 사용자 표시용으로 포맷
+
+5. **assistant 본문 선택**
+   - 우선순위: `assistantTexts` > `extractAssistantText(lastAssistant)` fallback
+   - raw API 에러 payload 그대로인 텍스트는 필터링
+
+6. **도구 오류 경고 추가(정책 기반)**
+   - mutating tool 실패/복구불가 오류 등을 조건으로 경고 문구 삽입
+
+7. **reply directive 정규화**
+   - `[[reply_to_current]]`, media URL, `audioAsVoice` 같은 지시자를 파싱/정규화
+
+8. **최종 payload 배열 반환**
+   - `{ text, mediaUrl(s), isError, replyTo..., audioAsVoice }` 형태로 변환
+   - 빈 payload/silent token payload 제거 후 반환
+
+#### “LLM 응답은 어느 필드에서 오나?” 정리
+
+최종 사용자 응답 텍스트의 주 소스는 `assistantTexts`이고,
+비어 있을 때만 `lastAssistant`에서 `extractAssistantText(...)`로 보완한다.
+
+즉, **스트리밍 누적 텍스트(`assistantTexts`) 우선 + 세션 마지막 assistant 메시지(`lastAssistant`) fallback** 구조다.
+
 ### 3) timeout인데 payload 비어 있으면 명시적 에러 반환 (`L1317~L1342`)
 - 유저 턴이 고아 상태로 끝나지 않게 보호
 
