@@ -8,6 +8,7 @@
     - [개요 및 동작 분석](pi-embedded-subscribe.md)
   - [agents/pi-embedded-runner/run/attempt.ts](runEmbeddedAttempt.md)
   - [agents/pi-embedded-runner/run.ts](run.ts-after-attempt.md)
+  - [Runtime Deep Dive: attempt / runEmbeddedAttempt / compaction](openclaw-runtime-attempt-compaction-deep-dive.md)
 
 - langChain
   - [LangChain 소개](langchain.md)
