@@ -1,5 +1,10 @@
 - [홈](README.md)
 
+- AI 활용
+  - skills
+    - [Agent 설계 철학 노트](ai-skills-agent-design-note.md)
+    - [OpenClaw Skill Registry](ai-skills-registry-openclaw.md)
+
 - AI 쉽게 배우기 (초6)
   - [AI와 LLM 지도](00-ai-llm-for-grade6.md)
 
