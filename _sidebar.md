@@ -6,20 +6,18 @@
     - [OpenClaw Skill Registry](ai-skills-registry-openclaw.md)
   - [LangChain 소개](langchain.md)
   - [LangGraph 소개](langgraph.md)
+  - openClaw
+    - agents/pi-embedded-subscribe.ts
+      - [개요 및 동작 분석](pi-embedded-subscribe.md)
+    - [agents/pi-embedded-runner/run/attempt.ts](runEmbeddedAttempt.md)
+    - [agents/pi-embedded-runner/run.ts](run.ts-after-attempt.md)
+    - [Runtime Deep Dive: attempt / runEmbeddedAttempt / compaction](openclaw-runtime-attempt-compaction-deep-dive.md)
+    - [세션 메모리 & Compaction 가이드](openclaw-session-memory-compaction-guide.md)
+  - crewAI
+    - [소개/주요기능/라이브러리/예시/소스분석 가이드](crewai-overview-and-source-analysis-guide.md)
 
 - AI 쉽게 배우기 (초6)
   - [AI와 LLM 지도](00-ai-llm-for-grade6.md)
-
-- openClaw
-  - agents/pi-embedded-subscribe.ts
-    - [개요 및 동작 분석](pi-embedded-subscribe.md)
-  - [agents/pi-embedded-runner/run/attempt.ts](runEmbeddedAttempt.md)
-  - [agents/pi-embedded-runner/run.ts](run.ts-after-attempt.md)
-  - [Runtime Deep Dive: attempt / runEmbeddedAttempt / compaction](openclaw-runtime-attempt-compaction-deep-dive.md)
-  - [세션 메모리 & Compaction 가이드](openclaw-session-memory-compaction-guide.md)
-
-- crewAI
-  - [소개/주요기능/라이브러리/예시/소스분석 가이드](crewai-overview-and-source-analysis-guide.md)
 
 - 날씨
   - [📊 한국 날씨 그래프](weather-dashboard.md)
