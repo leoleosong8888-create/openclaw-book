@@ -16,6 +16,7 @@
   - [agents/pi-embedded-runner/run/attempt.ts](runEmbeddedAttempt.md)
   - [agents/pi-embedded-runner/run.ts](run.ts-after-attempt.md)
   - [Runtime Deep Dive: attempt / runEmbeddedAttempt / compaction](openclaw-runtime-attempt-compaction-deep-dive.md)
+  - [세션 메모리 & Compaction 가이드](openclaw-session-memory-compaction-guide.md)
 
 - 날씨
   - [📊 한국 날씨 그래프](weather-dashboard.md)
